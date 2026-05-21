@@ -85,6 +85,40 @@ export async function saveKnock(knock: KnockRecord): Promise<void> {
   });
 }
 
+export async function createLead(lead: {
+  address: string;
+  homeowner: string;
+  phone: string;
+  contactPref: string;
+  roofType: string;
+  roofAge: number;
+  hailMesh: number;
+  damageProb: number;
+  source: string;
+}): Promise<void> {
+  await at('Leads', '', {
+    method: 'POST',
+    body: JSON.stringify({
+      records: [
+        {
+          fields: {
+            Address: lead.address,
+            Homeowner: lead.homeowner,
+            Phone: lead.phone,
+            'Contact Pref': lead.contactPref,
+            'Roof Type': lead.roofType,
+            'Roof Age': lead.roofAge,
+            'Hail Size MESH': lead.hailMesh,
+            'Damage Prob': Math.round(lead.damageProb * 100),
+            Source: lead.source,
+            Status: 'new',
+          },
+        },
+      ],
+    }),
+  });
+}
+
 // ─── Leads ────────────────────────────────────────────────────────────────────
 
 export interface AirtableLead {

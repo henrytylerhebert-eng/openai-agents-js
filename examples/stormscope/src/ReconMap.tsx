@@ -14,7 +14,13 @@ import {
   fetchParcelsByBbox,
   type ParcelAddress,
 } from './lafayette';
-import { isAirtableEnabled, fetchKnocks, saveKnock } from './airtable';
+import {
+  isAirtableEnabled,
+  fetchKnocks,
+  saveKnock,
+  createLead,
+} from './airtable';
+import { runAIScout, isAgentsEnabled } from './agents';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +41,7 @@ interface GeoProspect {
   lat: number;
   lon: number;
   address: string;
+  owner: string;
   hailSize: number;
   roofAge: number;
   roofType: string;
@@ -231,6 +238,7 @@ function generateGeoProspects(
       lat,
       lon,
       address,
+      owner: '',
       hailSize,
       roofAge,
       roofType,
@@ -275,6 +283,7 @@ function buildProspectsFromParcels(
         lat: p.lat,
         lon: p.lon,
         address: p.address,
+        owner: p.owner,
         hailSize: +nearestHail.toFixed(2),
         roofAge,
         roofType,
@@ -679,6 +688,82 @@ function DaySummary({ prospects }: { prospects: GeoProspect[] }) {
   );
 }
 
+// ─── Lead Capture Modal ───────────────────────────────────────────────────────
+
+function LeadCaptureModal({
+  prospect,
+  onSave,
+  onSkip,
+}: {
+  prospect: GeoProspect;
+  onSave: (name: string, phone: string, pref: string) => void;
+  onSkip: () => void;
+}) {
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [pref, setPref] = useState('phone');
+  return (
+    <div className="fixed inset-0 z-[2000] bg-black/70 flex items-end">
+      <div className="w-full bg-[#0f0f14] border-t border-zinc-700/80 rounded-t-2xl p-4 space-y-3">
+        <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-400">
+          ⭐ Hot Lead
+        </div>
+        <div className="text-[13px] font-semibold text-zinc-100 truncate">
+          {prospect.address}
+        </div>
+        {prospect.owner && (
+          <div className="text-[11px] text-zinc-500">
+            Owner on file: {prospect.owner}
+          </div>
+        )}
+        <input
+          placeholder="Homeowner name (optional)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-[12px] text-zinc-200 placeholder-zinc-600 outline-none focus:border-cyan-500/50"
+          autoFocus
+        />
+        <input
+          placeholder="Phone number (optional)"
+          value={phone}
+          onChange={(e) => setPhone(e.target.value)}
+          type="tel"
+          className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-[12px] text-zinc-200 placeholder-zinc-600 outline-none focus:border-cyan-500/50"
+        />
+        <div className="flex gap-2">
+          {(['phone', 'text', 'email'] as const).map((p) => (
+            <button
+              key={p}
+              onClick={() => setPref(p)}
+              className={`flex-1 py-2 rounded-xl border text-[10px] font-bold uppercase transition-all ${
+                pref === p
+                  ? 'bg-cyan-500/20 border-cyan-500/40 text-cyan-400'
+                  : 'bg-zinc-800 border-zinc-700 text-zinc-500'
+              }`}
+            >
+              {p === 'phone' ? '📞' : p === 'text' ? '💬' : '📧'} {p}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2 pt-1">
+          <button
+            onClick={onSkip}
+            className="flex-1 py-3 rounded-xl border border-zinc-700 bg-zinc-900 text-zinc-400 text-[11px] font-bold uppercase"
+          >
+            Skip
+          </button>
+          <button
+            onClick={() => onSave(name, phone, pref)}
+            className="flex-[2] py-3 rounded-xl bg-cyan-500/20 border border-cyan-500/40 text-cyan-400 text-[11px] font-bold uppercase tracking-wider"
+          >
+            ⭐ Save Hot Lead
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 type ListFilter = 'all' | 'priority' | 'interested' | 'done' | 'summary';
@@ -769,6 +854,59 @@ export function ReconMap({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [userPos, setUserPos] = useState<[number, number] | null>(null);
   const [filter, setFilter] = useState<ListFilter>('all');
+  const [captureProspect, setCaptureProspect] = useState<GeoProspect | null>(
+    null,
+  );
+  const [scoutReasons, setScoutReasons] = useState<Map<string, string>>(
+    new Map(),
+  );
+  const [scoutLoading, setScoutLoading] = useState(false);
+
+  const runScout = async () => {
+    if (scoutLoading) return;
+    setScoutLoading(true);
+    try {
+      const top20 = prospects
+        .filter((p) => p.status === 'unvisited')
+        .slice(0, 20)
+        .map((p) => ({
+          id: p.id,
+          address: p.address,
+          mesh: p.hailSize,
+          roof: p.roofType,
+          age: p.roofAge,
+          cond: 'unknown',
+          damageProb: p.damageProb,
+          closeProb: p.damageProb * 0.6,
+          expectedValue: p.damageProb * 15000,
+        }));
+      const rankings = await runAIScout(top20);
+      setScoutReasons(new Map(rankings.map((r) => [r.id, r.reason])));
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setScoutLoading(false);
+    }
+  };
+
+  const handleLeadSave = (name: string, phone: string, pref: string) => {
+    if (!captureProspect) return;
+    updateStatus(captureProspect.id, 'interested');
+    if (isAirtableEnabled()) {
+      createLead({
+        address: captureProspect.address,
+        homeowner: name,
+        phone,
+        contactPref: pref,
+        roofType: captureProspect.roofType,
+        roofAge: captureProspect.roofAge,
+        hailMesh: captureProspect.hailSize,
+        damageProb: captureProspect.damageProb,
+        source: 'Storm Canvass',
+      }).catch(console.error);
+    }
+    setCaptureProspect(null);
+  };
 
   // GPS
   useEffect(() => {
@@ -1008,6 +1146,18 @@ export function ReconMap({
         </button>
       </div>
 
+      {/* ── Lead Capture Modal ────────────────────────────────────────────── */}
+      {captureProspect && (
+        <LeadCaptureModal
+          prospect={captureProspect}
+          onSave={handleLeadSave}
+          onSkip={() => {
+            updateStatus(captureProspect.id, 'interested');
+            setCaptureProspect(null);
+          }}
+        />
+      )}
+
       {/* ── Bottom Sheet ──────────────────────────────────────────────────── */}
       <div
         className={`flex-shrink-0 bg-[#09090d] border-t border-zinc-800/70 overflow-hidden transition-all duration-300 ease-in-out ${
@@ -1027,12 +1177,32 @@ export function ReconMap({
                     </span>
                   )}
                 </div>
-                <button
-                  onClick={() => setListOpen(false)}
-                  className="text-zinc-600 hover:text-zinc-300 text-[16px] leading-none w-6 h-6 flex items-center justify-center"
-                >
-                  ✕
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={runScout}
+                    disabled={!isAgentsEnabled() || scoutLoading}
+                    title={
+                      !isAgentsEnabled()
+                        ? 'Add VITE_OPENAI_API_KEY to enable'
+                        : 'AI Scout — rank top targets'
+                    }
+                    className={`px-2.5 py-1 rounded-lg text-[9px] font-bold uppercase tracking-wider border transition-all ${
+                      scoutLoading
+                        ? 'bg-violet-500/10 border-violet-500/20 text-violet-400/50'
+                        : isAgentsEnabled()
+                          ? 'bg-violet-500/20 border-violet-500/30 text-violet-300 hover:bg-violet-500/30'
+                          : 'bg-zinc-800 border-zinc-700 text-zinc-600'
+                    }`}
+                  >
+                    {scoutLoading ? '⏳ Scouting…' : '⚡ Scout'}
+                  </button>
+                  <button
+                    onClick={() => setListOpen(false)}
+                    className="text-zinc-600 hover:text-zinc-300 text-[16px] leading-none w-6 h-6 flex items-center justify-center"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
 
               {/* Filter tabs */}
@@ -1078,6 +1248,11 @@ export function ReconMap({
                         <div className="text-[12px] font-bold text-zinc-100 truncate">
                           {selectedProspect.address}
                         </div>
+                        {selectedProspect.owner && (
+                          <div className="text-[10px] text-amber-400/70 truncate">
+                            {selectedProspect.owner}
+                          </div>
+                        )}
                         <div className="text-[10px] text-zinc-500 mt-0.5">
                           {selectedProspect.hailSize}" hail ·{' '}
                           {selectedProspect.roofAge}yr{' '}
@@ -1127,9 +1302,7 @@ export function ReconMap({
                       )}
                       {selectedProspect.status !== 'interested' && (
                         <button
-                          onClick={() =>
-                            updateStatus(selectedProspect.id, 'interested')
-                          }
+                          onClick={() => setCaptureProspect(selectedProspect)}
                           className="flex-1 py-2 rounded-lg bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 text-[10px] font-bold uppercase tracking-wider"
                         >
                           ⭐ Hot Lead
@@ -1185,9 +1358,19 @@ export function ReconMap({
                             <div className="text-[11px] font-semibold text-zinc-200 truncate">
                               {p.address}
                             </div>
+                            {p.owner && (
+                              <div className="text-[9px] text-amber-400/60 truncate">
+                                {p.owner}
+                              </div>
+                            )}
                             <div className="text-[9px] text-zinc-600">
                               {p.hailSize}" hail · {p.roofAge}yr {p.roofType}
                             </div>
+                            {scoutReasons.has(p.id) && (
+                              <div className="text-[9px] text-violet-400/80 mt-0.5 line-clamp-2">
+                                ⚡ {scoutReasons.get(p.id)}
+                              </div>
+                            )}
                           </div>
                           <div className="flex-shrink-0 flex items-center gap-2">
                             {/* Navigate shortcut */}

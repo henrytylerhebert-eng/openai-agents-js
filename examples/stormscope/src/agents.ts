@@ -9,13 +9,18 @@ import { z } from 'zod';
 
 setTracingDisabled(true);
 
+let _agentsReady = false;
+
 export function initAgents(apiKey: string): boolean {
   if (!apiKey) return false;
   // IMPORTANT: Do not expose your API key in production browser apps.
   // In production, route AI calls through your own backend proxy.
   setDefaultOpenAIClient(new OpenAI({ apiKey, dangerouslyAllowBrowser: true }));
+  _agentsReady = true;
   return true;
 }
+
+export const isAgentsEnabled = () => _agentsReady;
 
 // ─── Supplement Copilot ───────────────────────────────────────────────────────
 
