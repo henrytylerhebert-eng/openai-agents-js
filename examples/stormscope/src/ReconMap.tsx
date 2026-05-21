@@ -9,6 +9,12 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import {
+  fetchLSRHailReports,
+  fetchParcelsByBbox,
+  type ParcelAddress,
+} from './lafayette';
+import { isAirtableEnabled, fetchKnocks, saveKnock } from './airtable';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -134,51 +140,52 @@ const STREET_NAMES = [
 const STREET_TYPES = ['St', 'Ave', 'Dr', 'Blvd', 'Ln', 'Rd', 'Ct', 'Way', 'Pl'];
 const STREET_DIRS = ['N', 'S', 'E', 'W', ''];
 
+// Lafayette Parish demo reports (used when no live data is available)
 const FALLBACK_REPORTS: SPCReport[] = [
   {
     id: 0,
-    time: '1800',
-    size: '2.00',
-    loc: 'Edmond',
-    state: 'OK',
-    lat: 35.65,
-    lon: -97.48,
+    time: '1800Z',
+    size: '1.75',
+    loc: 'Lafayette',
+    state: 'LA',
+    lat: 30.224,
+    lon: -92.019,
   },
   {
     id: 1,
-    time: '1830',
-    size: '1.75',
-    loc: 'Moore',
-    state: 'OK',
-    lat: 35.34,
-    lon: -97.49,
+    time: '1815Z',
+    size: '2.00',
+    loc: 'Broussard',
+    state: 'LA',
+    lat: 30.139,
+    lon: -91.964,
   },
   {
     id: 2,
-    time: '1845',
-    size: '2.50',
-    loc: 'Midwest City',
-    state: 'OK',
-    lat: 35.45,
-    lon: -97.4,
+    time: '1830Z',
+    size: '1.50',
+    loc: 'Youngsville',
+    state: 'LA',
+    lat: 30.101,
+    lon: -91.997,
   },
   {
     id: 3,
-    time: '1900',
-    size: '1.25',
-    loc: 'Norman',
-    state: 'OK',
-    lat: 35.22,
-    lon: -97.44,
+    time: '1845Z',
+    size: '2.50',
+    loc: 'Carencro',
+    state: 'LA',
+    lat: 30.313,
+    lon: -92.04,
   },
   {
     id: 4,
-    time: '1910',
-    size: '3.00',
-    loc: 'Choctaw',
-    state: 'OK',
-    lat: 35.5,
-    lon: -97.27,
+    time: '1900Z',
+    size: '1.25',
+    loc: 'Scott',
+    state: 'LA',
+    lat: 30.235,
+    lon: -92.096,
   },
 ];
 
@@ -233,6 +240,51 @@ function generateGeoProspects(
       distanceKm: null,
     };
   }).sort((a, b) => b.priority - a.priority);
+}
+
+function buildProspectsFromParcels(
+  parcels: ParcelAddress[],
+  reports: SPCReport[],
+): GeoProspect[] {
+  const rng = seededRng(99);
+  const YEAR = new Date().getFullYear();
+  return parcels
+    .filter((p) => p.lat && p.lon)
+    .map((p, i) => {
+      let nearestHail = 1.0;
+      let minDist = Infinity;
+      for (const r of reports) {
+        const d = haversineKm(p.lat, p.lon, r.lat, r.lon);
+        if (d < minDist) {
+          minDist = d;
+          nearestHail = Math.max(parseFloat(r.size) || 1.0, 0.5);
+        }
+      }
+      const roofAge =
+        p.yearBuilt > 1900 ? YEAR - p.yearBuilt : Math.floor(rng() * 30 + 1);
+      const roofType = ROOF_TYPES[Math.floor(rng() * ROOF_TYPES.length)];
+      const sizeScore = Math.min(nearestHail / 3.0, 1.0) * 0.5;
+      const ageScore = Math.min(roofAge / 30, 1.0) * 0.32;
+      const variance = (rng() - 0.4) * 0.18;
+      const damageProb = Math.min(
+        Math.max(sizeScore + ageScore + variance, 0.04),
+        0.97,
+      );
+      return {
+        id: `P${String(i).padStart(4, '0')}`,
+        lat: p.lat,
+        lon: p.lon,
+        address: p.address,
+        hailSize: +nearestHail.toFixed(2),
+        roofAge,
+        roofType,
+        damageProb: +damageProb.toFixed(3),
+        priority: +damageProb.toFixed(3),
+        status: 'unvisited' as KnockStatus,
+        distanceKm: null,
+      };
+    })
+    .sort((a, b) => b.priority - a.priority);
 }
 
 // ─── Color helpers ────────────────────────────────────────────────────────────
@@ -638,17 +690,78 @@ export function ReconMap({
   spc: SPCReport[];
   spcLoading: boolean;
 }) {
-  const isDemoMode = spc.length === 0 && !spcLoading;
-  const reports = isDemoMode ? FALLBACK_REPORTS : spc;
+  const [lsrReports, setLsrReports] = useState<SPCReport[]>([]);
+  const [realProspectsLoaded, setRealProspectsLoaded] = useState(false);
+
+  const isDemoMode = spc.length === 0 && lsrReports.length === 0 && !spcLoading;
+  const reports =
+    lsrReports.length > 0
+      ? lsrReports
+      : spc.length > 0
+        ? spc
+        : FALLBACK_REPORTS;
 
   const [prospects, setProspects] = useState<GeoProspect[]>([]);
+
+  // Seeded fallback — fires immediately, replaced when real parcels arrive
   useEffect(() => {
+    if (realProspectsLoaded) return;
     const generated = generateGeoProspects(reports, 75, 42);
     const saved = loadSavedStatuses();
     setProspects(
       generated.map((p) => ({ ...p, status: saved[p.id] ?? p.status })),
     );
-  }, [reports]);
+  }, [reports, realProspectsLoaded]);
+
+  // Real Lafayette Parish data: LSR hail reports + Assessor parcel addresses
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const lsr = await fetchLSRHailReports(720);
+      if (cancelled || lsr.length === 0) return;
+
+      const asSPC: SPCReport[] = lsr.map((r, i) => ({
+        id: i,
+        time: r.time.slice(11, 16) + 'Z',
+        size: r.size,
+        loc: r.loc,
+        state: r.state,
+        lat: r.lat,
+        lon: r.lon,
+      }));
+      setLsrReports(asSPC);
+
+      const lats = asSPC.map((r) => r.lat);
+      const lons = asSPC.map((r) => r.lon);
+      const parcels = await fetchParcelsByBbox(
+        Math.min(...lats) - 0.08,
+        Math.min(...lons) - 0.08,
+        Math.max(...lats) + 0.08,
+        Math.max(...lons) + 0.08,
+        200,
+      );
+      if (cancelled || parcels.length === 0) return;
+
+      const saved = loadSavedStatuses();
+      let atStatuses: Record<string, KnockStatus> = {};
+      if (isAirtableEnabled()) {
+        const today = new Date().toISOString().slice(0, 10);
+        atStatuses = await fetchKnocks(today).catch(() => ({}));
+      }
+
+      const generated = buildProspectsFromParcels(parcels, asSPC);
+      setProspects(
+        generated.map((p) => ({
+          ...p,
+          status: atStatuses[p.address] ?? saved[p.id] ?? p.status,
+        })),
+      );
+      setRealProspectsLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [heatVisible, setHeatVisible] = useState(true);
   const [pinsVisible, setPinsVisible] = useState(true);
@@ -685,6 +798,22 @@ export function ReconMap({
     setProspects((prev) => {
       const next = prev.map((p) => (p.id === id ? { ...p, status } : p));
       saveStatuses(next);
+      if (isAirtableEnabled()) {
+        const p = next.find((x) => x.id === id);
+        if (p) {
+          saveKnock({
+            address: p.address,
+            status,
+            stormDate: new Date().toISOString().slice(0, 10),
+            lat: p.lat,
+            lon: p.lon,
+            hailSize: p.hailSize,
+            roofAge: p.roofAge,
+            roofType: p.roofType,
+            damageProb: p.damageProb,
+          }).catch(console.error);
+        }
+      }
       return next;
     });
     setSelectedId(null);
@@ -796,8 +925,10 @@ export function ReconMap({
         <div className="absolute top-3 left-3 z-[1000] bg-black/75 backdrop-blur-sm rounded-xl border border-zinc-700/50 px-3 py-2">
           <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-amber-400 leading-tight">
             {isDemoMode
-              ? '⚡ Demo — OKC Storm'
-              : `🌩️ ${reports.length} SPC Reports`}
+              ? '⚡ Demo — Lafayette Parish'
+              : lsrReports.length > 0
+                ? `🌩️ ${lsrReports.length} LSR · Lafayette`
+                : `🌩️ ${reports.length} SPC Reports`}
           </div>
           <div className="text-[10px] text-zinc-300 mt-0.5">
             {counts.unvisited} to knock
